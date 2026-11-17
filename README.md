@@ -94,3 +94,12 @@ This project is provided under the MIT License. It is an independent implementat
 The live tracker intentionally records a boon only when ArcDPS identifies the local character as both the source and destination (`src->self`, `dst->self`, and matching agent IDs). For example, a Stability application with skill ID `1122` is added using its `value` duration in milliseconds, then displayed as a countdown. Applications cast by another player onto you, or applications you cast onto another player, are ignored.
 
 The tracker consumes ArcDPS realtime `combat_local` events, not a text dump of the `.zevtc` file. This is necessary for an on-screen live countdown; the on-disk EVTC/ZE​​VTC log is a binary combat log and is generally finalized after the encounter. Realtime buff events can be filtered by ArcDPS visibility rules, so a missing event in WvW cannot be recovered by this callback.
+
+
+## Diagnostic build (0.2.0-diagnostic)
+
+This build registers both ArcDPS `combat_local` and `combat` callbacks and deduplicates the same Arc event by event id. The Nexus panel displays callback counts, null-agent notifications, local agent ID, recognized boon-event count, local-target matches, last skill ID/duration, statechange flags, and last source/target names.
+
+Test procedure: enter a map, wait for the panel to show `Bridge: OPEN`, apply a boon to yourself, then inspect the counters. If callback counters remain zero, check ArcDPS extension loading. If callbacks rise but boon events remain zero, inspect the last event fields and ArcDPS version. If boon events rise but target matches remain zero, capture the diagnostic panel and share it for further analysis.
+
+Note: the live ArcDPS API is filtered and cannot provide a complete history of every boon in every WvW situation. This diagnostic build tests the actual callback path; it does not parse a continuously written `.zevtc` file.

@@ -61,6 +61,8 @@ struct ArcDpsExports {
 
 using ArcCombatLocal = void (*)(ArcCbtEvent*, ArcAgent*, ArcAgent*, char*,
                                 std::uint64_t, std::uint64_t);
+using ArcCombatArea = void (*)(ArcCbtEvent*, ArcAgent*, ArcAgent*, const char*,
+                               std::uint64_t, std::uint64_t);
 
 inline constexpr std::uint8_t CBTS_BUFFINITIAL = 18;
 inline constexpr std::uint8_t CBTS_BUFFACTIVE = 27;

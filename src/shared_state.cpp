@@ -41,6 +41,7 @@ bool SharedState::Open() noexcept {
         view_->magic = kSharedMagic;
         view_->version = kSharedVersion;
         view_->feed_seen = 0;
+        std::memset(&view_->diagnostics, 0, sizeof(view_->diagnostics));
         std::memset(view_->track_count, 0, sizeof(view_->track_count));
         std::memset(view_->expires_at_ms, 0, sizeof(view_->expires_at_ms));
         MemoryBarrier();
@@ -78,6 +79,15 @@ void SharedState::Publish(const std::uint32_t* track_count,
     InterlockedIncrement(&view_->sequence); // even: stable snapshot
 }
 
+void SharedState::PublishDiagnostics(const SharedDiagnostics& diagnostics) noexcept {
+    if (!view_) return;
+    InterlockedIncrement(&view_->sequence);
+    MemoryBarrier();
+    view_->diagnostics = diagnostics;
+    MemoryBarrier();
+    InterlockedIncrement(&view_->sequence);
+}
+
 bool SharedState::Read(SharedSnapshot& out) const noexcept {
     if (!view_) {
         return false;
@@ -93,6 +103,7 @@ bool SharedState::Read(SharedSnapshot& out) const noexcept {
         out.magic = view_->magic;
         out.version = view_->version;
         out.feed_seen = view_->feed_seen;
+        out.diagnostics = view_->diagnostics;
         std::memcpy(out.track_count, view_->track_count, sizeof(out.track_count));
         std::memcpy(out.expires_at_ms, view_->expires_at_ms, sizeof(out.expires_at_ms));
         MemoryBarrier();

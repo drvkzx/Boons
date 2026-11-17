@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <deque>
+#include <unordered_set>
 #include <mutex>
 #include <unordered_map>
 
@@ -91,153 +93,184 @@ void PublishSnapshot(std::uint64_t now) {
     g_shared.Publish(track_counts.data(), expiries.data(), g_feed_seen);
 }
 
-void OnCombatLocal(ArcCbtEvent* ev, ArcAgent* src, ArcAgent* dst,
-                   char* /*skillname*/, std::uint64_t /*id*/, std::uint64_t /*revision*/) {
+boonpanel::SharedDiagnostics g_diag{};
+std::unordered_set<std::uint64_t> g_seen_event_ids;
+std::deque<std::uint64_t> g_seen_order;
+
+void CopyAgentName(char (&out)[48], const ArcAgent* agent) {
+    out[0] = '\0';
+    if (!agent || !agent->name) return;
+    strncpy_s(out, agent->name, _TRUNCATE);
+}
+
+bool IsLocalTarget(const ArcCbtEvent* ev, const ArcAgent* dst) noexcept {
+    if (ev && g_diag.local_agent_id != 0 && ev->dst_agent == g_diag.local_agent_id)
+        return true;
+    // Fallback is useful on Arc builds which populate self on the event agent.
+    return dst && dst->self != 0;
+}
+
+bool IsLocalSource(const ArcCbtEvent* ev, const ArcAgent* src) noexcept {
+    if (ev && g_diag.local_agent_id != 0 && ev->src_agent == g_diag.local_agent_id)
+        return true;
+    return src && src->self != 0;
+}
+
+bool AlreadyProcessed(std::uint64_t event_id) {
+    if (event_id == 0) return false;
+    if (g_seen_event_ids.contains(event_id)) return true;
+    g_seen_event_ids.insert(event_id);
+    g_seen_order.push_back(event_id);
+    if (g_seen_order.size() > 4096) {
+        g_seen_event_ids.erase(g_seen_order.front());
+        g_seen_order.pop_front();
+    }
+    return false;
+}
+
+void OnCombatEvent(ArcCbtEvent* ev, ArcAgent* src, ArcAgent* dst,
+                   std::uint64_t event_id, bool local_callback) {
+    std::lock_guard<std::mutex> lock(g_tracker_mutex);
+    const std::uint64_t now = boonpanel::TickNowMs();
+    if (local_callback) ++g_diag.local_callbacks;
+    else ++g_diag.area_callbacks;
+
     if (!ev) {
+        ++g_diag.null_events;
+        // ArcDPS agent-add notifications carry the local-player marker in dst->self.
+        if (src && dst && dst->self != 0 && src->id != 0) {
+            g_diag.local_agent_id = static_cast<std::uint64_t>(src->id);
+        }
+        g_diag.bridge_open = g_shared.IsOpen() ? 1 : 0;
+        g_feed_seen = true;
+        g_shared.PublishDiagnostics(g_diag);
+        PublishSnapshot(now);
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_tracker_mutex);
-    const std::uint64_t now = boonpanel::TickNowMs();
+    g_diag.last_skill_id = ev->skillid;
+    g_diag.last_value = ev->value;
+    g_diag.last_statechange = ev->is_statechange;
+    g_diag.last_buff = ev->buff;
+    g_diag.last_buffremove = ev->is_buffremove;
+    g_diag.last_src_self = src ? static_cast<std::uint8_t>(src->self != 0) : 0;
+    g_diag.last_dst_self = dst ? static_cast<std::uint8_t>(dst->self != 0) : 0;
+    CopyAgentName(g_diag.last_src_name, src);
+    CopyAgentName(g_diag.last_dst_name, dst);
+    g_diag.bridge_open = g_shared.IsOpen() ? 1 : 0;
+    g_feed_seen = true; // distinguish a loaded callback from a dead bridge
 
-    // Map changes are not boon skill events, so clear before filtering by skill ID.
+    if (AlreadyProcessed(event_id)) {
+        g_shared.PublishDiagnostics(g_diag);
+        PublishSnapshot(now);
+        return;
+    }
+
     if (ev->is_statechange == CBTS_MAPCHANGE) {
-        for (auto& boon_stacks : g_tracked) {
-            boon_stacks.clear();
-        }
-        g_feed_seen = false;
+        for (auto& boon_stacks : g_tracked) boon_stacks.clear();
+        g_shared.PublishDiagnostics(g_diag);
         PublishSnapshot(now);
         return;
     }
 
     const int index = boonpanel::IndexForSkillId(ev->skillid);
     if (index < 0) {
+        g_shared.PublishDiagnostics(g_diag);
+        PublishSnapshot(now);
         return;
     }
 
     auto& stacks = g_tracked[static_cast<std::size_t>(index)];
     const std::uint32_t track_id = TrackId(*ev);
+    const bool target_is_local = IsLocalTarget(ev, dst);
+    const bool source_is_local = IsLocalSource(ev, src);
 
-    // ArcDPS has two buff-event encodings in the wild. The classic encoding
-    // uses ordinary CBTS_COMBAT events (statechange == 0, buff == 1), while
-    // newer builds may use dedicated statechanges 69-72. Handle both.
+    if (target_is_local) ++g_diag.local_target_matches;
+    ++g_diag.boon_events;
+
+    // Classic CBTS_COMBAT buff events: buff=1, value is applied duration;
+    // is_buffremove distinguishes removal bookkeeping.
     if (ev->is_statechange == 0 && ev->buff != 0) {
-        if (ev->is_buffremove == 0 && ev->buff_dmg == 0) {
-            if (IsLocalRecipient(dst)) {
-                ApplyStack(stacks, 0, ev->value, now);
-                g_feed_seen = true;
-            }
-        } else if (ev->is_buffremove == 1 && IsSelf(src)) {
-            // CBTB_ALL. CBTB_MANUAL (3) is ArcDPS's synthetic companion event
-            // and is intentionally ignored to avoid double-removing stacks.
+        if (ev->is_buffremove == 0 && ev->value > 0 && target_is_local) {
+            ApplyStack(stacks, 0, ev->value, now);
+        } else if (ev->is_buffremove == 1 && source_is_local) {
             stacks.clear();
-            g_feed_seen = true;
-        } else if (ev->is_buffremove == 2 && IsSelf(src)) {
-            // CBTB_SINGLE.
+        } else if (ev->is_buffremove == 2 && source_is_local) {
             RemoveOneStack(stacks);
-            g_feed_seen = true;
         }
-        if (g_feed_seen) PublishSnapshot(now);
+        g_shared.PublishDiagnostics(g_diag);
+        PublishSnapshot(now);
         return;
     }
 
     switch (ev->is_statechange) {
-    case CBTS_BUFFAPPLY: {
-        if (!IsLocalRecipient(dst)) {
-            return;
-        }
-        ApplyStack(stacks, track_id, ev->value, now);
-        g_feed_seen = true;
+    case CBTS_BUFFAPPLY:
+        if (target_is_local && ev->value > 0) ApplyStack(stacks, track_id, ev->value, now);
         break;
-    }
-    case CBTS_BUFFINITIAL: {
-        if (!IsLocalRecipient(dst)) {
-            return;
+    case CBTS_BUFFINITIAL:
+        if (target_is_local) {
+            const std::int32_t duration = ev->value > 0 ? ev->value : ev->buff_dmg;
+            ApplyStack(stacks, track_id, duration, now);
         }
-        // BUFFINITIAL describes an already-active stack. value is its current
-        // remaining duration; buff_dmg is the original duration fallback.
-        const std::int32_t duration = ev->value > 0 ? ev->value : ev->buff_dmg;
-        ApplyStack(stacks, track_id, duration, now);
-        g_feed_seen = true;
         break;
-    }
     case CBTS_BUFFACTIVE: {
-        if (!IsSelf(src)) {
-            return;
+        if (source_is_local) {
+            const std::uint32_t active_track_id = static_cast<std::uint32_t>(ev->dst_agent);
+            if (active_track_id != 0 && ev->value > 0)
+                stacks[active_track_id] = { now + static_cast<std::uint32_t>(ev->value) };
         }
-        // BUFFACTIVE stores the trackable id in dst_agent, not in pad61.
-        const std::uint32_t active_track_id = static_cast<std::uint32_t>(ev->dst_agent);
-        if (active_track_id != 0 && ev->value > 0) {
-            stacks[active_track_id] = { now + static_cast<std::uint32_t>(ev->value) };
-        }
-        g_feed_seen = true;
         break;
     }
-    case CBTS_BUFFDEACTIVE: {
-        if (!IsSelf(src)) {
-            return;
+    case CBTS_BUFFDEACTIVE:
+        if (source_is_local && track_id != 0) {
+            if (ev->value <= 0) stacks.erase(track_id);
+            else stacks[track_id] = { now + static_cast<std::uint32_t>(ev->value) };
         }
-        if (track_id != 0) {
-            if (ev->value <= 0) {
-                stacks.erase(track_id);
-            } else {
-                stacks[track_id] = { now + static_cast<std::uint32_t>(ev->value) };
-            }
-        }
-        g_feed_seen = true;
         break;
-    }
-    case CBTS_BUFFCHANGE: {
-        // BUFFCHANGE's dst_agent is the agent whose existing stack changed.
-        // Do not count buffs this player applies to someone else.
-        if (!IsSelf(dst)) {
-            return;
+    case CBTS_BUFFCHANGE:
+        if (target_is_local && track_id != 0) {
+            if (ev->overstack_value == 0) stacks.erase(track_id);
+            else stacks[track_id] = { now + ev->overstack_value };
         }
-        if (track_id != 0) {
-            if (ev->overstack_value == 0) {
-                stacks.erase(track_id);
-            } else {
-                stacks[track_id] = { now + ev->overstack_value };
-            }
-        }
-        g_feed_seen = true;
         break;
-    }
-    case CBTS_BUFFREMOVE_SINGLE: {
-        if (!IsSelf(src)) {
-            return;
-        }
-        if (track_id != 0) {
-            stacks.erase(track_id);
-        }
-        g_feed_seen = true;
+    case CBTS_BUFFREMOVE_SINGLE:
+        if (source_is_local && track_id != 0) stacks.erase(track_id);
         break;
-    }
-    case CBTS_BUFFREMOVE_ALL: {
-        if (!IsSelf(src)) {
-            return;
-        }
-        stacks.clear();
-        g_feed_seen = true;
+    case CBTS_BUFFREMOVE_ALL:
+        if (source_is_local) stacks.clear();
         break;
-    }
     default:
-        return;
+        break;
     }
 
+    g_shared.PublishDiagnostics(g_diag);
     PublishSnapshot(now);
+}
+
+void OnCombatLocal(ArcCbtEvent* ev, ArcAgent* src, ArcAgent* dst,
+                   char* /*skillname*/, std::uint64_t id, std::uint64_t /*revision*/) {
+    OnCombatEvent(ev, src, dst, id, true);
+}
+
+void OnCombatArea(ArcCbtEvent* ev, ArcAgent* src, ArcAgent* dst,
+                  const char* /*skillname*/, std::uint64_t id, std::uint64_t /*revision*/) {
+    OnCombatEvent(ev, src, dst, id, false);
 }
 
 ArcDpsExports g_arc_exports{};
 
 ArcDpsExports* ArcModInit() {
-    g_shared.Open();
+    const bool bridge_ok = g_shared.Open();
     {
         std::lock_guard<std::mutex> lock(g_tracker_mutex);
         for (auto& boon_stacks : g_tracked) {
             boon_stacks.clear();
         }
         g_feed_seen = false;
+        g_diag = {};
+        g_diag.bridge_open = bridge_ok ? 1 : 0;
+        g_seen_event_ids.clear();
+        g_seen_order.clear();
         PublishSnapshot(boonpanel::TickNowMs());
     }
 
@@ -247,6 +280,7 @@ ArcDpsExports* ArcModInit() {
     g_arc_exports.imguivers = 19270; // ArcDPS currently uses ImGui 1.92.7; no Arc UI callback is used.
     g_arc_exports.out_name = "BoonPanel data bridge";
     g_arc_exports.out_build = "0.1.0";
+    g_arc_exports.combat = reinterpret_cast<void*>(static_cast<ArcCombatArea>(&OnCombatArea));
     g_arc_exports.combat_local = reinterpret_cast<void*>(static_cast<ArcCombatLocal>(&OnCombatLocal));
     return &g_arc_exports;
 }
@@ -258,6 +292,9 @@ void ArcModRelease() {
             boon_stacks.clear();
         }
         g_feed_seen = false;
+        g_diag = {};
+        g_seen_event_ids.clear();
+        g_seen_order.clear();
         PublishSnapshot(boonpanel::TickNowMs());
     }
     g_shared.Close();

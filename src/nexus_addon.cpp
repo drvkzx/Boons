@@ -145,11 +145,34 @@ void AddonRender() {
             }
         }
 
-        if (!read_ok || snapshot.feed_seen == 0) {
-            ImGui::TextWrapped("Waiting for ArcDPS boon events. Apply a boon to yourself after entering the map to start tracking.");
-            ImGui::TextDisabled("The event feed cannot always reconstruct boons already active before tracking begins.");
-        } else if (active_count == 0) {
-            ImGui::TextDisabled("No tracked boons active.");
+        if (!read_ok) {
+            ImGui::TextWrapped("DIAGNOSTIC: Shared bridge is not readable. Check that both DLL copies are installed in the same GW2 process.");
+        } else {
+            const auto& d = snapshot.diagnostics;
+            ImGui::Text("Bridge: %s | Local player agent: %s", d.bridge_open ? "OPEN" : "CLOSED",
+                        d.local_agent_id ? "KNOWN" : "UNKNOWN");
+            ImGui::Text("Callbacks: local %llu | area %llu | null-agent %llu",
+                        static_cast<unsigned long long>(d.local_callbacks),
+                        static_cast<unsigned long long>(d.area_callbacks),
+                        static_cast<unsigned long long>(d.null_events));
+            ImGui::Text("Boon events: %llu | target matches: %llu",
+                        static_cast<unsigned long long>(d.boon_events),
+                        static_cast<unsigned long long>(d.local_target_matches));
+            ImGui::Text("Local agent ID: %llu | Last skill: %u | value: %d ms",
+                        static_cast<unsigned long long>(d.local_agent_id), d.last_skill_id, d.last_value);
+            ImGui::Text("Last event: statechange=%u buff=%u remove=%u | src self=%u dst self=%u",
+                        d.last_statechange, d.last_buff, d.last_buffremove,
+                        d.last_src_self, d.last_dst_self);
+            ImGui::Text("Last agents: %s -> %s", d.last_src_name, d.last_dst_name);
+            if (snapshot.feed_seen == 0 || active_count == 0) {
+                ImGui::TextWrapped("No active boon durations yet. Apply a boon to yourself and watch the counters above.");
+            }
+            if (ImGui::CollapsingHeader("Diagnostic details")) {
+                ImGui::TextDisabled("If callbacks stay at zero, ArcDPS did not load this extension or callback registration failed.");
+                ImGui::TextDisabled("If callbacks rise but boon events stay at zero, ArcDPS is not sending recognized boon events.");
+                ImGui::TextDisabled("If boon events rise but target matches stay at zero, local-agent identification/target matching is the problem.");
+                ImGui::TextDisabled("If target matches rise but no tiles activate, inspect skill IDs, duration values and shared state.");
+            }
         }
 
         int shown = 0;
